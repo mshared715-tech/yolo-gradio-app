@@ -1,136 +1,116 @@
-import threading
-import time
+import os
 import cv2
 import gradio as gr
 from ultralytics import YOLO
 from collections import defaultdict
 
+# Load YOLO model
 model = YOLO("best.pt")
 
+# ========= COMMON DETECTION =========
+def detect_and_count(frame):
+    # Resize for speed
+    resize_width = 640
+    h, w = frame.shape[:2]
+    scale = resize_width / w
+    frame = cv2.resize(frame, (resize_width, int(h * scale)))
 
-class VideoStreamHandler:
-    def __init__(self, source):
-        self.cap = cv2.VideoCapture(source, cv2.CAP_DSHOW)
-        if not self.cap.isOpened():
-            self.cap = cv2.VideoCapture(source)
+    # Inference
+    results = model(frame, imgsz=256, verbose=False)
 
-        self.ret, self.frame = False, None
-        self.stopped = False
-        self.lock = threading.Lock()
+    # Annotated frame
+    annotated = results[0].plot()
+    boxes = results[0].boxes
+    counts = defaultdict(int)
 
-        self.fps = self.cap.get(cv2.CAP_PROP_FPS)
-        if self.fps == 0 or self.fps > 120:
-            self.fps = 30
-        self.frame_delay = 1.0 / self.fps
+    if boxes is not None and boxes.cls is not None:
+        for cls_id in boxes.cls:
+            class_name = model.names[int(cls_id)]
+            counts[class_name] += 1
 
-    def start(self):
-        thread = threading.Thread(target=self.update, args=())
-        thread.daemon = True
-        thread.start()
-        return self
+    rgb = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
 
-    def update(self):
-        while not self.stopped:
-            ret, frame = self.cap.read()
-            if not ret:
-                self.stopped = True
-                break
-            with self.lock:
-                self.frame = frame
-            time.sleep(0.01)
+    stats = "### 📊 Current Frame Object Counts\n"
+    if counts:
+        for k, v in counts.items():
+            stats += f"- **{k}**: {v}\n"
+    else:
+        stats += "_No objects detected_\n"
 
-    def read(self):
-        with self.lock:
-            return self.frame
-
-    def stop(self):
-        self.stopped = True
-        self.cap.release()
-
-    def get_fps(self):
-        return self.fps
+    return rgb, stats
 
 
-def stream_detection(source, is_webcam=False):
-    streamer = VideoStreamHandler(source).start()
-    time.sleep(1.0)
+# ========= WEBCAM STREAM =========
+def webcam_stream(frame):
+    if frame is None:
+        return None, "No frame received"
+    return detect_and_count(frame)
 
-    video_fps = streamer.get_fps()
-    frame_time = 1.0 / video_fps
-    last_frame_time = time.time()
 
-    while not streamer.stopped:
-        frame = streamer.read()
-        if frame is None:
+# ========= VIDEO STREAM =========
+def video_stream(video_path):
+    cap = cv2.VideoCapture(video_path)
+
+    if not cap.isOpened():
+        yield None, "Could not open video"
+        return
+
+    frame_skip = 2  # Process every 2nd frame
+    frame_count = 0
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        frame_count += 1
+
+        # Skip frames for speed
+        if frame_count % frame_skip != 0:
             continue
 
-        results = model(frame, imgsz=320, verbose=False)
-        annotated_frame = results[0].plot()
+        output_frame, stats = detect_and_count(frame)
 
-        # Count objects in the current frame
-        boxes = results[0].boxes
-        frame_counts = defaultdict(int)
-        if boxes is not None and boxes.cls is not None:
-            for cls_id in boxes.cls:
-                class_name = model.names[int(cls_id)]
-                frame_counts[class_name] += 1
+        yield output_frame, stats
 
-        # Convert BGR → RGB for Gradio
-        output_frame = cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB)
-
-        if not is_webcam:
-            current_time = time.time()
-            elapsed = current_time - last_frame_time
-            if elapsed < frame_time:
-                time.sleep(frame_time - elapsed)
-            last_frame_time = time.time()
-
-        # Format counts as Markdown
-        md_stats = "### Current Frame Object Counts\n"
-        if frame_counts:
-            for k, v in frame_counts.items():
-                md_stats += f"- **{k}**: {v}\n"
-        else:
-            md_stats += "_No objects detected_\n"
-
-        yield output_frame, md_stats
-
-    streamer.stop()
+    cap.release()
 
 
-def stream_video(video_file):
-    yield from stream_detection(video_file, is_webcam=False)
-
-
-def stream_webcam():
-    yield from stream_detection(0, is_webcam=True)
-
-
+# ========= UI =========
 with gr.Blocks() as app:
-    gr.Markdown("## 🎥 Real-Time YOLO Object Detection (Per-Frame Stats)")
+    gr.Markdown("## 🎥 YOLO Object Detection (Webcam + Video Only Detected Objects)")
 
     with gr.Tabs():
-        with gr.Tab("📁 Video"):
-            gr.Markdown("Upload a video file to start detection")
-            video_output = gr.Image(streaming=True, label="Detection Output")
-            video_stats = gr.Markdown(label="Detection Statistics")
-            video_upload = gr.UploadButton("Upload Video", file_types=["video"], file_count="single")
-            video_upload.upload(
-                fn=stream_video,
-                inputs=video_upload,
-                outputs=[video_output, video_stats]
-            )
 
+        # ----- Webcam Tab -----
         with gr.Tab("📷 Webcam"):
-            gr.Markdown("Click to start real-time webcam detection")
-            cam_output = gr.Image(streaming=True, label="Live Detection")
-            cam_stats = gr.Markdown(label="Detection Statistics")
-            start_cam = gr.Button("Start Webcam")
-            start_cam.click(
-                fn=stream_webcam,
+            cam_input = gr.Image(sources=["webcam"], streaming=True)
+            cam_output = gr.Image()
+            cam_stats = gr.Markdown()
+
+            cam_input.stream(
+                fn=webcam_stream,
+                inputs=cam_input,
                 outputs=[cam_output, cam_stats]
             )
 
+        # ----- Video Upload Tab -----
+        with gr.Tab("📁 Upload Video"):
+            video_input = gr.Video()
+            video_output = gr.Image()
+            video_stats = gr.Markdown()
 
+            video_input.change(
+                fn=video_stream,
+                inputs=video_input,
+                outputs=[video_output, video_stats]
+            )
+
+
+# ========= LAUNCH =========
 if __name__ == "__main__":
-    app.launch(server_name="0.0.0.0", server_port=7860)
+    port = int(os.environ.get("PORT", 7860))
+    app.launch(
+        server_name="0.0.0.0",
+        server_port=port
+    )
